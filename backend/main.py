@@ -95,68 +95,104 @@ def fetch_company_news(company_name):
     return articles
 
 
-# -------------------- GEMINI SUMMARY --------------------
-def summarize_with_gemini(company_name, website, news_text):
+def summarize_with_langchain(company_name, website, news_text):
     prompt = f"""
 You are a sales assistant. Summarize the company "{company_name}" using the info below.
 Include:
 - Official website: {website}
-- Recent news (headlines + short notes): {news_text}
+- Recent news: {news_text}
 
-Return as plain English text ONLY. No markdown, no asterisks, no bullets, no headings.
+Return plain English only. No markdown, no asterisks, no bullets, no headings.
 Keep it concise and useful for an IT sales representative.
 """
     model = genai.GenerativeModel("gemini-2.5-flash")
     try:
-        response = model.generate_content(prompt)
-        return (response.text or "").replace("*", "").strip()
+        resp = model.generate_content(prompt)
+        return (resp.text or "").replace("*", "").strip()
     except Exception as e:
         return f"Error generating summary: {e}"
 
-
-# -------------------- ROUTES --------------------
+# ---------- routes ----------
 @app.get("/")
 def root():
-    return {"message": "Backend is running with Gemini AI + News API 🚀"}
-
+    return {"message": "Backend running ✅"}
 
 @app.get("/search_companies")
 def search_companies(query: str = Query(..., description="Company name to search")):
-    candidate_queries = [
-        f"{query} site:linkedin.com",
-        f"{query} site:crunchbase.com"
-    ]
-    candidates = []
-    for q in candidate_queries:
+    candidates, seen = [], set()
+    for q in (f"{query} site:linkedin.com", f"{query} site:crunchbase.com"):
         try:
-            results = duckduckgo_search(q, max_results=3)
-            for r in results:
-                if len(candidates) < 5 and r["url"] not in [c["url"] for c in candidates]:
-                    candidates.append(r)
+            for r in duckduckgo_search(q, max_results=3):
+                if r["url"] not in seen and len(candidates) < 5:
+                    candidates.append(r); seen.add(r["url"])
         except Exception as e:
-            print(f"Search error: {e}")
+            print("Search error:", e)
     return {"candidates": candidates}
 
-
 @app.get("/company_info")
-def company_info(selected_name: Optional[str] = Query(None, description="Selected company name")):
+async def company_info(
+    selected_name: Optional[str] = Query(None, description="Selected company name"),
+    db: Session = Depends(get_db),
+    user = Depends(get_current_user)
+):
     if not selected_name or selected_name.strip() == "":
         return {"error": "Please provide a valid selected_name query parameter."}
 
     website = get_official_website(selected_name) or "Unknown"
-
-    # Fetch top 4 news
     news_list = fetch_company_news(selected_name)
-    news_text = " | ".join(
-        [f"{n.get('title', '')}. {n.get('description', '')}" for n in news_list if n.get("title")]
-    ) or "No recent news found."
+
+    news_text = " | ".join([
+        f"{n.get('title','')}. {n.get('description','')}".strip()
+        for n in news_list if n.get("title")
+    ]) or "No recent news found."
 
     summary = summarize_with_gemini(selected_name, website, news_text)
 
-    return {
-        "company": selected_name,
-        "website": website,
-        "summary": summary,
-        "news": news_list  # top 4 only
-    }
+    # persist (associate user if logged in; guest otherwise)
+    search = Search(user_id=(user or {}).get("user_id"), query_text=selected_name, selected_name=selected_name)
+    db.add(search); db.flush()
+
+    db.add(Summary(search_id=search.id, company_name=selected_name, official_website=website, summary_text=summary))
+    for idx, n in enumerate(news_list[:4], start=1):
+        db.add(NewsItem(
+            search_id=search.id,
+            title=n.get("title"),
+            description=n.get("description"),
+            url=n.get("url"),
+            source=n.get("source"),
+            published_at=n.get("publishedAt"),
+            rank=idx
+        ))
+    db.commit()
+
+    return {"company": selected_name, "website": website, "summary": summary, "news": news_list}
+
+@app.get("/history")
+async def history(limit: int = 10, db: Session = Depends(get_db), user = Depends(get_current_user)):
+    if not user or not user.get("user_id"):
+        raise HTTPException(status_code=401, detail="Login required")
+    uid = user["user_id"]
+    rows = (
+        db.query(Search)
+        .filter(Search.user_id == uid)
+        .order_by(Search.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    out = []
+    for s in rows:
+        summ = db.query(Summary).filter(Summary.search_id == s.id).first()
+        news = db.query(NewsItem).filter(NewsItem.search_id == s.id).order_by(NewsItem.rank.asc()).all()
+        out.append({
+            "query": s.query_text,
+            "selected_name": s.selected_name,
+            "created_at": s.created_at.isoformat(),
+            "summary": getattr(summ, "summary_text", None),
+            "website": getattr(summ, "official_website", None),
+            "news": [
+                {"title": n.title, "description": n.description, "url": n.url, "source": n.source, "publishedAt": n.published_at}
+                for n in news
+            ]
+        })
+    return {"items": out}
 
